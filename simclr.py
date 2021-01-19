@@ -1,15 +1,11 @@
-import logging
-import os
-import sys
-
 import torch
-import torch.nn.functional as F
+from models.resnet_simclr import ResNetSimCLR
 from torch.utils.tensorboard import SummaryWriter
-from tqdm import tqdm
-
-from utils import save_config_file, accuracy, save_checkpoint
-
-torch.manual_seed(0)
+import torch.nn.functional as F
+from loss.nt_xent import NTXentLoss
+import os
+import shutil
+import sys
 
 apex_support = False
 try:
@@ -21,87 +17,182 @@ except:
     print("Please install apex for mixed precision training from: https://github.com/NVIDIA/apex")
     apex_support = False
 
+import numpy as np
+
+torch.manual_seed(0)
+
+
+def _save_config_file(model_checkpoints_folder):
+    if not os.path.exists(model_checkpoints_folder):
+        os.makedirs(model_checkpoints_folder)
+        shutil.copy('./config.yaml', os.path.join(model_checkpoints_folder, 'config.yaml'))
+
 
 class SimCLR(object):
 
-    def __init__(self, *args, **kwargs):
-        self.args = kwargs['args']
-        self.model = kwargs['model'].to(self.args.device)
-        self.optimizer = kwargs['optimizer']
-        self.scheduler = kwargs['scheduler']
-        self.writer = SummaryWriter()
-        logging.basicConfig(filename=os.path.join(self.writer.log_dir, 'training.log'), level=logging.DEBUG)
-        self.criterion = torch.nn.CrossEntropyLoss().to(self.args.device)
+    def __init__(self, dataset, config):
+        self.config = config
+        self.device = self._get_device()
+        self.writer = SummaryWriter(log_dir=config["log_dir"])
+        self.dataset = dataset
+        self.nt_xent_criterion = NTXentLoss(self.device, config['batch_size'], **config['loss'])
 
-    def info_nce_loss(self, features):
-        batch_targets = torch.arange(self.args.batch_size, dtype=torch.long).to(self.args.device)
-        batch_targets = torch.cat(self.args.n_views * [batch_targets])
+    def _get_device(self):
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        print("Running on:", device)
+        return device
 
-        features = F.normalize(features, dim=1)
+    def _step(self, model, xis, xjs, n_iter):
 
-        similarity_matrix = torch.matmul(features, features.T)
-        # assert similarity_matrix.shape == (
-        #     self.args.n_views * self.args.batch_size, self.args.n_views * self.args.batch_size)
+        # get the representations and the projections
+        ris, zis = model(xis)  # [N,C]
 
-        mask = torch.eye(len(batch_targets)).to(self.args.device)
-        similarities = similarity_matrix[~mask.bool()].view(similarity_matrix.shape[0], -1)
-        similarities = similarities / self.args.temperature
-        return similarities, batch_targets
+        # get the representations and the projections
+        rjs, zjs = model(xjs)  # [N,C]
 
-    def train(self, train_loader):
+        # normalize projection feature vectors
+        zis = F.normalize(zis, dim=1)
+        zjs = F.normalize(zjs, dim=1)
 
-        if apex_support and self.args.fp16_precision:
-            logging.debug("Using apex for fp16 precision training.")
-            self.model, self.optimizer = amp.initialize(self.model, self.optimizer,
-                                                        opt_level='O2',
-                                                        keep_batchnorm_fp32=True)
+        loss = self.nt_xent_criterion(zis, zjs)
+        return loss
+
+    def train(self):
+
+        train_loader, valid_loader = self.dataset.get_data_loaders()
+
+        model = ResNetSimCLR(**self.config["model"]).to(self.device)
+        model = self._load_pre_trained_weights(model)
+
+        optimizer = torch.optim.Adam(model.parameters(), 3e-4, weight_decay=eval(self.config['weight_decay']))
+
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=len(train_loader), eta_min=0,
+                                                               last_epoch=-1)
+
+        if apex_support and self.config['fp16_precision']:
+            model, optimizer = amp.initialize(model, optimizer,
+                                              opt_level='O2',
+                                              keep_batchnorm_fp32=True)
+
+        model_checkpoints_folder = os.path.join(self.writer.log_dir, 'checkpoints')
+
         # save config file
-        save_config_file(self.writer.log_dir, self.args)
+        _save_config_file(model_checkpoints_folder)
 
         n_iter = 0
-        logging.info(f"Start SimCLR training for {self.args.epochs} epochs.")
-        logging.info(f"Training with gpu: {self.args.disable_cuda}.")
+        valid_n_iter = 0
+        best_valid_loss = np.inf
 
-        for epoch_counter in range(self.args.epochs):
-            for images, _ in tqdm(train_loader):
-                images = torch.cat(images, dim=0)
+        for epoch_counter in range(self.config['epochs']):
+            print(epoch_counter, end='\r')
+            for (xis, xjs), _ in train_loader:
+                optimizer.zero_grad()
 
-                images = images.to(self.args.device)
+                xis = xis.to(self.device)
+                xjs = xjs.to(self.device)
 
-                features = self.model(images)
-                logits, labels = self.info_nce_loss(features)
-                loss = self.criterion(logits, labels)
+                loss = self._step(model, xis, xjs, n_iter)
 
-                self.optimizer.zero_grad()
-                if apex_support and self.args.fp16_precision:
-                    with amp.scale_loss(loss, self.optimizer) as scaled_loss:
+                if n_iter % self.config['log_every_n_steps'] == 0:
+                    self.writer.add_scalar('train_loss', loss, global_step=n_iter)
+
+                if apex_support and self.config['fp16_precision']:
+                    with amp.scale_loss(loss, optimizer) as scaled_loss:
                         scaled_loss.backward()
                 else:
                     loss.backward()
 
-                self.optimizer.step()
-
-                if n_iter % self.args.log_every_n_steps == 0:
-                    top1, top5 = accuracy(logits, labels, topk=(1, 5))
-                    self.writer.add_scalar('loss', loss, global_step=n_iter)
-                    self.writer.add_scalar('acc/top1', top1[0], global_step=n_iter)
-                    self.writer.add_scalar('acc/top5', top5[0], global_step=n_iter)
-                    self.writer.add_scalar('learning_rate', self.scheduler.get_lr()[0], global_step=n_iter)
-
+                optimizer.step()
                 n_iter += 1
+
+            # validate the model if requested
+            if epoch_counter % self.config['eval_every_n_epochs'] == 0:
+                valid_loss = self._validate(model, valid_loader)
+                if valid_loss < best_valid_loss:
+                    # save the model weights
+                    best_valid_loss = valid_loss
+                    torch.save(model.state_dict(), os.path.join(model_checkpoints_folder, 'model.pth'))
+
+                self.writer.add_scalar('validation_loss', valid_loss, global_step=valid_n_iter)
+                valid_n_iter += 1
 
             # warmup for the first 10 epochs
             if epoch_counter >= 10:
-                self.scheduler.step()
-            logging.debug(f"Epoch: {epoch_counter}\tLoss: {loss}\tTop1 accuracy: {top1[0]}")
+                scheduler.step()
+            self.writer.add_scalar('cosine_lr_decay', scheduler.get_lr()[0], global_step=n_iter)
 
-        logging.info("Training has finished.")
-        # save model checkpoints
-        checkpoint_name = 'checkpoint_{:04d}.pth.tar'.format(self.args.epochs)
-        save_checkpoint({
-            'epoch': self.args.epochs,
-            'arch': self.args.arch,
-            'state_dict': self.model.state_dict(),
-            'optimizer': self.optimizer.state_dict(),
-        }, is_best=False, filename=os.path.join(self.writer.log_dir, checkpoint_name))
-        logging.info(f"Model checkpoint and metadata has been saved at {self.writer.log_dir}.")
+    def _load_pre_trained_weights(self, model):
+        try:
+            checkpoints_folder = os.path.join(self.config["log_dir"], 'checkpoints')
+            state_dict = torch.load(os.path.join(checkpoints_folder, 'model.pth'))
+            model.load_state_dict(state_dict)
+            print("Loaded pre-trained model with success.")
+        except FileNotFoundError:
+            print("Pre-trained weights not found. Training from scratch.")
+
+        return model
+
+    def _validate(self, model, valid_loader):
+
+        # validation steps
+        with torch.no_grad():
+            model.eval()
+
+            valid_loss = 0.0
+            counter = 0
+            for (xis, xjs), _ in valid_loader:
+                xis = xis.to(self.device)
+                xjs = xjs.to(self.device)
+
+                loss = self._step(model, xis, xjs, counter)
+                valid_loss += loss.item()
+                counter += 1
+            valid_loss /= counter
+        model.train()
+        return valid_loss
+
+    def plot(self):
+        import matplotlib.pyplot as plt
+        from sklearn.cluster import KMeans
+        from sklearn.decomposition import PCA
+        from sklearn.manifold import TSNE
+        import seaborn as sns
+
+        def _plot(v, labels, centroids, fname):
+            fig = plt.figure(figsize=(10, 10))
+            plt.axis('off')
+            sns.set_style("darkgrid")
+            sns.scatterplot(x=v[:, 0], y=v[:, 1], hue=labels, legend='full', palette=sns.color_palette("bright", 10))
+            sns.scatterplot(x=centroids[:, 0], y=centroids[:, 1], marker='x')
+            plt.legend(list(range(10)))
+            plt.savefig(fname)
+            plt.close()
+
+        with torch.no_grad():
+            train_loader, valid_loader = self.dataset.get_data_loaders()
+            model = ResNetSimCLR(**self.config["model"]).cpu()
+            model = self._load_pre_trained_weights(model)
+            kmeans = KMeans(n_clusters=10)
+            # pca = PCA(n_components=2)
+            # tsne = TSNE()
+
+            model.eval()
+            x = []
+            y_ = []
+            for (xis, xjs), y in train_loader:
+                ris, zis = model(xjs)  # [N,C]
+                x.append(ris.cpu())
+                y_.append(y.cpu())
+
+            y = torch.stack(y_).cpu().view(-1)
+            x = torch.stack(x).cpu().view(-1, 512)
+
+            # x = tsne.fit_transform(x)
+            # y_tsne = kmeans.fit_transform(pca.fit_transform(x))
+            # _plot(x, y, kmeans.cluster_centers_, 'cluster.png')
+            for i in range(1, 3):
+                print(i)
+                kmeans = KMeans(n_clusters=10)
+                kmeans.fit(x)
+                with open(f'kmeans_centers_{i}.npy', 'wb') as f:
+                    np.save(f, kmeans.cluster_centers_)

@@ -8,7 +8,7 @@ def main():
     dataset = DataSetWrapper(config['batch_size'], **config['dataset'])
 
     simclr = SimCLR(dataset, config)
-    simclr.train()
+    simclr.plot()
 
 
 if __name__ == "__main__":
